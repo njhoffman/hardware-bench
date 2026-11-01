@@ -1,0 +1,228 @@
+#!/usr/bin/env python3
+"""Benchmark this machine and rank it among OpenBenchmarking.org results.
+
+Usage: hardware-bench [run] [--full] [--no-gpu] [--offline] [--only KEY,...] [-y] [-n]
+       hardware-bench show [HOST] [--json]
+       hardware-bench report
+       hardware-bench list
+
+run (default) runs the quick set (about 10 minutes, one run per test) or with
+--full every test three times plus PassMark pt (about an hour), through the
+Phoronix Test Suite with uploads turned off. Each score gets its world-wide
+percentile, the run is saved as <results>/<host>/<date>.json, and the
+generated block in the notes file is rewritten (results: HB_RESULTS, default
+~/.local/share/hardware-bench/results; notes: HB_NOTES, default
+~/.local/share/hardware-bench/hardware.md). GPU tests are
+skipped without a display. -n prints the plan; -y skips the busy-machine
+question. show prints a host's latest run, report rewrites hardware.md from
+the saved runs, list prints the tests.
+"""
+import argparse
+from datetime import datetime, timezone
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / 'lib'))
+import conditions  # noqa: E402
+import percentile as pc  # noqa: E402
+import pt  # noqa: E402
+import pts  # noqa: E402
+import render  # noqa: E402
+import sets  # noqa: E402
+import store  # noqa: E402
+
+
+def die(msg):
+    print(f'hardware-bench: {msg}', file=sys.stderr)
+    sys.exit(1)
+
+
+def match(test, results):
+    """The module's result for test: same suite test, the wanted unit if several."""
+    cands = [r for r in results if r['test'] == test.test]
+    if test.unit:
+        cands = [r for r in cands if (r.get('unit') or '').lower() == test.unit.lower()] or cands
+    return cands[0] if cands else None
+
+
+def entry(test, r, retrieved):
+    ae = r.get('ae') or {}
+    cuts = pc.cut_points(ae.get('percentiles'))
+    hib = r.get('hib', True)
+    # OpenBenchmarking.org timestamps are UTC.
+    day = lambda ts: datetime.fromtimestamp(int(ts), timezone.utc).date().isoformat() if ts else None  # noqa: E731
+    return {
+        'key': test.key, 'label': test.label, 'component': test.component,
+        'test': f"{r['test']}-{r.get('version')}", 'arguments': r.get('arguments'),
+        'unit': r.get('unit'), 'hib': hib, 'value': r.get('value'),
+        'percentile': pc.rank(r.get('value'), cuts, hib),
+        'samples': ae.get('samples'), 'data_source': r.get('source'),
+        'data_first': day(ae.get('first_appeared')), 'data_last': day(ae.get('last_appeared')),
+        'data_retrieved': retrieved, 'cuts': cuts,
+    }
+
+
+def plan(tests, args, gpu_skip):
+    times = 3 if args.full else 1
+    out = [f"{'full' if args.full else 'quick'} set, {times} run(s) per test"]
+    for i, p in enumerate(sets.passes(tests), 1):
+        out.append(f'suite run {i}: ' + ' '.join(t.test for t in p))
+        presets = ';'.join(x for x in (t.preset() for t in p) if x)
+        if presets:
+            out.append(f'  PRESET_OPTIONS={presets}')
+    if gpu_skip:
+        out.append(f'GPU tests skipped: {gpu_skip}')
+    if args.full and not args.only:
+        out.append('then PassMark pt -r 3 (CPU + memory; asks for sudo; network blocked)')
+    return '\n'.join(out)
+
+
+def confirm(question):
+    if not sys.stdin.isatty():
+        return True
+    try:
+        return input(f'{question} [y/N] ').strip().lower().startswith('y')
+    except EOFError:
+        return False
+
+
+def cmd_run(args):
+    gpu_skip = None
+    if args.no_gpu:
+        gpu_skip = '--no-gpu'
+    elif not conditions.has_display():
+        gpu_skip = 'no display'
+    try:
+        tests = sets.select(args.full, gpu=gpu_skip is None, only=args.only)
+    except ValueError as e:
+        die(str(e))
+    if args.dry_run:
+        print(plan(tests, args, gpu_skip))
+        return 0
+    suite = pts.Suite()
+    if tests and not suite.binary:
+        die('phoronix-test-suite not found: install it (README: Requirements) or set HB_PTS')
+    cond = conditions.snapshot()
+    warn = conditions.warnings(cond)
+    for w in warn:
+        print(f'hardware-bench: {w}', file=sys.stderr)
+    if cond['busy'] and not args.yes and not confirm('The machine is busy; run anyway?'):
+        return 1
+
+    host = store.hostname()
+    started = datetime.now().astimezone().isoformat(timespec='seconds')
+    stamp = started[:16].replace('-', '').replace(':', '').replace('T', '-')
+    times = 3 if args.full else 1
+    rec = {'host': host, 'started': started, 'set': 'only' if args.only else 'full' if args.full else 'quick',
+           'runs_per_test': times, 'conditions': cond, 'warnings': warn,
+           'suite': {}, 'system': {}, 'tests': [], 'skipped': [], 'passmark': None}
+    if gpu_skip:
+        rec['skipped'] += [{'key': t.key, 'reason': gpu_skip}
+                           for t in sets.select(args.full, only=args.only) if t.needs_display]
+
+    if tests:
+        suite.configure()
+        rec['suite']['version'] = suite.version()
+        for i, group in enumerate(sets.passes(tests), 1):
+            name = f'hb-{host.lower()}-{stamp}-{i}'
+            if not suite.benchmark(group, times, name, host):
+                rec['skipped'] += [{'key': t.key, 'reason': 'the suite saved no result'} for t in group]
+                continue
+            rec['system'] = rec['system'] or suite.system(name)
+            data = suite.percentiles(name, offline=args.offline)
+            rec['suite']['system_type'] = data.get('system_type')
+            retrieved = datetime.fromtimestamp(data.get('retrieved', 0)).astimezone().isoformat(timespec='seconds')
+            rec['data_retrieved'] = retrieved
+            for t in group:
+                r = match(t, data.get('results', []))
+                if r is None or r.get('value') is None:
+                    rec['skipped'].append({'key': t.key, 'reason': 'no result value'})
+                else:
+                    rec['tests'].append(entry(t, r, retrieved))
+
+    if args.full and not args.only:
+        binary = pt.find_binary()
+        if not binary:
+            rec['skipped'].append({'key': 'passmark', 'reason': 'pt not installed (README: Requirements)'})
+        elif not sys.stdin.isatty():
+            rec['skipped'].append({'key': 'passmark', 'reason': 'no terminal for its sudo prompt'})
+        else:
+            rec['passmark'] = pt.run(binary)
+            if rec['passmark'] is None:
+                rec['skipped'].append({'key': 'passmark', 'reason': 'pt wrote no results'})
+
+    if suite.stray:
+        warn.append(f'the suite created {suite.stray} despite its config; check it and remove it')
+        print(f'hardware-bench: {warn[-1]}', file=sys.stderr)
+    order = {t.key: i for i, t in enumerate(sets.TESTS)}
+    rec['tests'].sort(key=lambda t: order.get(t['key'], 99))
+    rec['summary'] = pc.summarize(rec['tests'])
+    rec['finished'] = datetime.now().astimezone().isoformat(timespec='seconds')
+    if not rec['tests'] and not rec['passmark']:
+        die('nothing ran: ' + '; '.join(f"{s['key']}: {s['reason']}" for s in rec['skipped']))
+    path = store.save(rec)
+    print()
+    print(render.terminal(rec, render.use_color(sys.stdout)))
+    print(f'\nsaved {path}')
+    report()
+    return 0
+
+
+def report():
+    recs = [store.latest(h, complete=True) for h in store.hosts()]
+    notes = store.notes_file()
+    text = notes.read_text() if notes.exists() else '# Hardware\n'
+    notes.write_text(render.update_notes(text, render.md_block([r for r in recs if r])))
+    print(f'updated {notes}')
+
+
+def cmd_show(args):
+    host = args.host or store.hostname()
+    rec = store.latest(host)
+    if rec is None:
+        die(f'no runs for {host} (known: {", ".join(store.hosts()) or "none"})')
+    if args.json:
+        print(json.dumps(rec, indent=1))
+    else:
+        print(render.terminal(rec, render.use_color(sys.stdout), rec.get('warnings') or ()))
+    return 0
+
+
+def cmd_list(_args):
+    for t in sets.TESTS:
+        opts = ', '.join(f'{k}={v}' for k, v in t.options)
+        print(f"{'full ' if t.full_only else 'quick'}  {t.component:6}  {t.key:16}  {t.test}" + (f'  [{opts}]' if opts else ''))
+    print('full   pt              PassMark pt -r 3 (CPU Mark, Memory Mark)')
+    return 0
+
+
+def main(argv):
+    ap = argparse.ArgumentParser(prog='hardware-bench', description=__doc__.split('\n')[0])
+    sub = ap.add_subparsers(dest='cmd')
+    run = sub.add_parser('run', help='benchmark this machine (default)')
+    for p in (ap, run):
+        p.add_argument('--full', action='store_true', help='every test, three runs each, plus PassMark pt')
+        p.add_argument('--no-gpu', action='store_true', help='skip the GPU tests')
+        p.add_argument('--offline', action='store_true', help="use the suite's bundled percentile data")
+        p.add_argument('--only', type=lambda s: [x for x in s.split(',') if x], help='only these test keys (see list)')
+        p.add_argument('-y', '--yes', action='store_true', help='run even when the machine is busy')
+        p.add_argument('-n', '--dry-run', action='store_true', help='print the plan')
+    show = sub.add_parser('show', help="a host's latest run")
+    show.add_argument('host', nargs='?')
+    show.add_argument('--json', action='store_true')
+    sub.add_parser('report', help='rewrite the generated block in hardware.md')
+    sub.add_parser('list', help='the tests in each set')
+    args = ap.parse_args(argv)
+    if args.cmd == 'show':
+        return cmd_show(args)
+    if args.cmd == 'report':
+        report()
+        return 0
+    if args.cmd == 'list':
+        return cmd_list(args)
+    return cmd_run(args)
+
+
+if __name__ == '__main__':
+    sys.exit(main(sys.argv[1:]))

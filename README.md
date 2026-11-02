@@ -72,3 +72,7 @@ just install           # links bin/hardware-bench into ~/.local/bin (or $XDG_BIN
 `just test`: `tests/hardware_bench_cases.py` (unittest) against a stub suite
 and stub pt, plus the CLI (`tests/hardware-bench.bats`). `just lint` runs
 pyflakes.
+
+## License
+
+MIT, see [LICENSE](LICENSE).

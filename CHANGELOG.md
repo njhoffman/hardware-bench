@@ -5,6 +5,12 @@ versions follow [semantic versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.1] - 2026-11-02
+
+### Added
+
+- MIT license (`LICENSE`).
+
 ## [0.1.0] - 2026-11-01
 
 First release on its own, extracted from njhoffman/.shell (`scripts/tools/hardware-bench/`), where it shipped

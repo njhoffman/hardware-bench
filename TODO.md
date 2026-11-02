@@ -28,8 +28,7 @@ Reviewed: 2026-11-01
 
 ## 2. Packaging and docs
 
-- [ ] **Add a LICENSE.** (p2) [chore] The repo is meant to be public; pick a
-  license before publishing.
+- [x] **Add a LICENSE.** (p2) [chore] MIT, 2026-11-02.
 - [ ] **Install the suite from the repo.** (p3) [feature] The pinned suite
   (version, checksum, PHP packages, wrapper) is documented in the README but
   installed by a dotfiles recipe; a `just deps` would make the repo
